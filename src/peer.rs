@@ -1,5 +1,5 @@
 use crate::peer::pb::peer_service_client::PeerServiceClient;
-use crate::peer::pb::peer_service_server::PeerService;
+use crate::peer::pb::peer_service_server::{PeerService, PeerServiceServer};
 use crate::peer::pb::{Clock, Message, Successful};
 use crate::poisson::Poisson;
 use crate::{RATE, WORDS_FILE_PATH, log};
@@ -10,10 +10,13 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::time::sleep;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 pub mod pb {
@@ -42,15 +45,11 @@ impl Connections {
 
 pub struct MessageExecutionQueue {
     pub t: Vec<Message>,
-    pub notifier: Notify,
 }
 
 impl MessageExecutionQueue {
     pub fn new() -> Self {
-        Self {
-            t: Vec::new(),
-            notifier: Notify::new(),
-        }
+        Self { t: Vec::new() }
     }
 
     pub fn ordered_push(&mut self, message: Message) {
@@ -60,8 +59,6 @@ impl MessageExecutionQueue {
             let clock_2 = m_2.clock.unwrap();
             (clock_2.timestamp, clock_2.sender_id).cmp(&(clock_1.timestamp, clock_1.sender_id))
         });
-
-        self.notifier.notify_one();
     }
 
     pub fn pop(&mut self) -> Option<Message> {
@@ -73,6 +70,7 @@ impl MessageExecutionQueue {
     }
 }
 
+#[derive(Clone)]
 pub struct PeerState {
     pub address: String,
     pub id: u32,
@@ -95,7 +93,7 @@ impl PeerState {
     }
 
     pub async fn run(
-        &self,
+        self,
         peer_indexes_addresses: Vec<(u32, String)>,
     ) -> Result<(), Box<dyn Error>> {
         for (peer_index, peer_address) in peer_indexes_addresses {
@@ -106,6 +104,8 @@ impl PeerState {
             };
 
             tokio::spawn(async move {
+                sleep(Duration::from_secs(4)).await;
+
                 let mut client = match PeerServiceClient::connect(peer_address.clone()).await {
                     Ok(client) => client,
                     Err(e) => {
@@ -161,7 +161,7 @@ impl PeerState {
                         current_time
                     };
 
-                    let len = words.read().await.len();
+                    let len = { words.read().await.len() };
 
                     let content = {
                         let i = poisson_process.rng.random_range(0..len);
@@ -197,13 +197,7 @@ impl PeerState {
 
             tokio::spawn(async move {
                 loop {
-                    message_execution_queue
-                        .read()
-                        .await
-                        .notifier
-                        .notified()
-                        .await;
-
+                    sleep(Duration::from_secs(1)).await;
                     let number_of_unique_peers =
                         async |message_execution_queue: &Arc<RwLock<MessageExecutionQueue>>| {
                             let set = message_execution_queue.read().await.get_all().iter().fold(
@@ -220,8 +214,13 @@ impl PeerState {
 
                     let mut peers_count = number_of_unique_peers(&message_execution_queue).await;
 
-                    while peers_count >= connections.read().await.peers.len() {
-                        match message_execution_queue.write().await.pop() {
+                    loop {
+                        if peers_count < connections.read().await.peers.len() + 1 {
+                            break;
+                        }
+
+                        let message_to_execute = { message_execution_queue.write().await.pop() };
+                        match message_to_execute {
                             Some(message_to_print) => {
                                 log::info(&cformat!(
                                     "<bold>{}:</bold> {}",
@@ -237,6 +236,11 @@ impl PeerState {
                 }
             });
         }
+
+        Server::builder()
+            .add_service(PeerServiceServer::new(self.clone()))
+            .serve(SocketAddr::from_str(&self.address).unwrap())
+            .await?;
 
         Ok(())
     }
