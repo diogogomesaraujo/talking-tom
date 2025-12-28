@@ -52,13 +52,15 @@ impl MessageExecutionQueue {
         Self { t: Vec::new() }
     }
 
-    pub fn ordered_push(&mut self, message: Message) {
+    pub fn ordered_push(&mut self, message: Message, notifier: &Arc<Notify>) {
         self.t.push(message);
         self.t.sort_by(|m_1, m_2| {
             let clock_1 = m_1.clock.unwrap();
             let clock_2 = m_2.clock.unwrap();
             (clock_2.timestamp, clock_2.sender_id).cmp(&(clock_1.timestamp, clock_1.sender_id))
         });
+
+        notifier.notify_waiters();
     }
 
     pub fn pop(&mut self) -> Option<Message> {
@@ -78,6 +80,7 @@ pub struct PeerState {
     pub connections: Arc<RwLock<Connections>>,
     pub message_execution_queue: Arc<RwLock<MessageExecutionQueue>>,
     pub words: Arc<RwLock<Vec<String>>>,
+    pub notifier: Arc<Notify>,
 }
 
 impl PeerState {
@@ -89,6 +92,7 @@ impl PeerState {
             connections: Arc::new(RwLock::new(Connections::new())),
             message_execution_queue: Arc::new(RwLock::new(MessageExecutionQueue::new())),
             words: Arc::new(RwLock::new(Self::words_from_file(WORDS_FILE_PATH)?)),
+            notifier: Arc::new(Notify::new()),
         })
     }
 
@@ -142,6 +146,7 @@ impl PeerState {
             let words = self.words.clone();
             let connections = self.connections.clone();
             let message_execution_queue = self.message_execution_queue.clone();
+            let notifier = self.notifier.clone();
 
             let mut seed: [u8; 32] = [0u8; 32];
             rng().fill_bytes(&mut seed);
@@ -180,7 +185,7 @@ impl PeerState {
                         message_execution_queue
                             .write()
                             .await
-                            .ordered_push(message.clone());
+                            .ordered_push(message.clone(), &notifier);
                     }
 
                     if let Err(_) = connections.read().await.broadcast(message).await {
@@ -194,10 +199,12 @@ impl PeerState {
         {
             let message_execution_queue = self.message_execution_queue.clone();
             let connections = self.connections.clone();
+            let notifier = self.notifier.clone();
 
             tokio::spawn(async move {
                 loop {
-                    sleep(Duration::from_secs(1)).await;
+                    notifier.notified().await;
+
                     let number_of_unique_peers =
                         async |message_execution_queue: &Arc<RwLock<MessageExecutionQueue>>| {
                             let set = message_execution_queue.read().await.get_all().iter().fold(
@@ -237,9 +244,11 @@ impl PeerState {
             });
         }
 
+        let address = self.address.clone();
+
         Server::builder()
-            .add_service(PeerServiceServer::new(self.clone()))
-            .serve(SocketAddr::from_str(&self.address).unwrap())
+            .add_service(PeerServiceServer::new(self))
+            .serve(SocketAddr::from_str(&address).unwrap())
             .await?;
 
         Ok(())
@@ -265,6 +274,8 @@ impl PeerService for PeerState {
         &self,
         request: Request<Message>,
     ) -> Result<Response<Successful>, Status> {
+        let notifier = self.notifier.clone();
+
         let received_message = request.into_inner();
         if let Some(clock) = &received_message.clock {
             {
@@ -275,7 +286,7 @@ impl PeerService for PeerState {
             self.message_execution_queue
                 .write()
                 .await
-                .ordered_push(received_message);
+                .ordered_push(received_message, &notifier);
         }
 
         Ok(Response::new(Successful {}))

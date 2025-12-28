@@ -1,12 +1,9 @@
-use std::time::Duration;
-
 use chat_with_tom::{
     CONFIG_FILE_PATH,
     config::{addresses_from_file, split_from_id},
     peer::PeerState,
 };
 use clap::Parser;
-use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
