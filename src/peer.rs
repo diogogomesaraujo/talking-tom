@@ -1,8 +1,8 @@
 use crate::peer::pb::peer_service_client::PeerServiceClient;
 use crate::peer::pb::peer_service_server::{PeerService, PeerServiceServer};
-use crate::peer::pb::{Clock, Message, Successful};
+use crate::peer::pb::{Clock, Message, RequestStatus};
 use crate::poisson::Poisson;
-use crate::{RATE, WORDS_FILE_PATH, log};
+use crate::{MALICIOUS_RATE, MAX_DIFF, RATE, WORDS_FILE_PATH, log};
 use color_print::cformat;
 use rand::{Rng, RngCore, rng};
 use std::cmp::max;
@@ -11,6 +11,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
+use std::process::exit;
 use std::str::FromStr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
@@ -43,6 +44,12 @@ impl Connections {
     }
 }
 
+#[derive(Clone)]
+pub enum Intentions {
+    Benevolent,
+    Malicious,
+}
+
 pub struct MessageExecutionQueue {
     pub t: Vec<Message>,
 }
@@ -52,7 +59,7 @@ impl MessageExecutionQueue {
         Self { t: Vec::new() }
     }
 
-    pub fn ordered_push(&mut self, message: Message, notifier: &Arc<Notify>) {
+    pub fn ordered_push(&mut self, message: Message, push_notifier: &Arc<Notify>) {
         self.t.push(message);
         self.t.sort_by(|m_1, m_2| {
             let clock_1 = m_1.clock.unwrap();
@@ -60,7 +67,7 @@ impl MessageExecutionQueue {
             (clock_2.timestamp, clock_2.sender_id).cmp(&(clock_1.timestamp, clock_1.sender_id))
         });
 
-        notifier.notify_waiters();
+        push_notifier.notify_waiters();
     }
 
     pub fn pop(&mut self) -> Option<Message> {
@@ -76,23 +83,27 @@ impl MessageExecutionQueue {
 pub struct PeerState {
     pub address: String,
     pub id: u32,
+    pub intentions: Intentions,
     pub time: Arc<RwLock<u64>>,
     pub connections: Arc<RwLock<Connections>>,
+    pub history: Arc<RwLock<HashMap<u32, u64>>>,
     pub message_execution_queue: Arc<RwLock<MessageExecutionQueue>>,
     pub words: Arc<RwLock<Vec<String>>>,
-    pub notifier: Arc<Notify>,
+    pub push_notifier: Arc<Notify>,
 }
 
 impl PeerState {
-    pub fn new(id: u32, address: String) -> Result<Self, Box<dyn Error>> {
+    pub fn new(id: u32, address: String, intentions: Intentions) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             address,
             id,
+            intentions,
             time: Arc::new(RwLock::new(0)),
             connections: Arc::new(RwLock::new(Connections::new())),
             message_execution_queue: Arc::new(RwLock::new(MessageExecutionQueue::new())),
             words: Arc::new(RwLock::new(Self::words_from_file(WORDS_FILE_PATH)?)),
-            notifier: Arc::new(Notify::new()),
+            push_notifier: Arc::new(Notify::new()),
+            history: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -102,6 +113,7 @@ impl PeerState {
     ) -> Result<(), Box<dyn Error>> {
         for (peer_index, peer_address) in peer_indexes_addresses {
             let connections = self.connections.clone();
+
             let peer_address = match peer_address.starts_with("http") {
                 true => peer_address.clone(),
                 false => format!("http://{}", peer_address),
@@ -128,17 +140,24 @@ impl PeerState {
                 }
 
                 loop {
-                    if let Some(msg) = rx.recv().await {
-                        let request = Request::new(msg);
+                    tokio::select! {
+                        Some(msg) = rx.recv() => {
+                             let request = Request::new(msg);
 
-                        if let Err(_) = client.send_message(request).await {
-                            log::error("Failed to send message to peer.");
-                            return;
-                        }
+                             if let Err(_) = client.send_message(request).await {
+                                 log::error("Failed to send message to peer.");
+                                 return;
+                             }
+                         }
                     }
                 }
             });
         }
+
+        let mut seed: [u8; 32] = [0u8; 32];
+        rng().fill_bytes(&mut seed);
+
+        let poisson_process = Arc::new(RwLock::new(Poisson::new(RATE, &mut seed)));
 
         {
             let id = self.id.clone();
@@ -146,17 +165,13 @@ impl PeerState {
             let words = self.words.clone();
             let connections = self.connections.clone();
             let message_execution_queue = self.message_execution_queue.clone();
-            let notifier = self.notifier.clone();
-
-            let mut seed: [u8; 32] = [0u8; 32];
-            rng().fill_bytes(&mut seed);
-
-            let mut poisson_process = Poisson::new(RATE, &mut seed);
+            let push_notifier = self.push_notifier.clone();
+            let poisson_process = poisson_process.clone();
 
             tokio::spawn(async move {
                 loop {
                     sleep(Duration::from_secs_f32(
-                        poisson_process.time_for_next_event(),
+                        poisson_process.write().await.time_for_next_event(),
                     ))
                     .await;
 
@@ -169,7 +184,7 @@ impl PeerState {
                     let len = { words.read().await.len() };
 
                     let content = {
-                        let i = poisson_process.rng.random_range(0..len);
+                        let i = poisson_process.write().await.rng.random_range(0..len);
                         words.read().await[i].clone()
                     };
 
@@ -185,7 +200,7 @@ impl PeerState {
                         message_execution_queue
                             .write()
                             .await
-                            .ordered_push(message.clone(), &notifier);
+                            .ordered_push(message.clone(), &push_notifier);
                     }
 
                     if let Err(_) = connections.read().await.broadcast(message).await {
@@ -199,11 +214,11 @@ impl PeerState {
         {
             let message_execution_queue = self.message_execution_queue.clone();
             let connections = self.connections.clone();
-            let notifier = self.notifier.clone();
+            let push_notifier = self.push_notifier.clone();
 
             tokio::spawn(async move {
                 loop {
-                    notifier.notified().await;
+                    push_notifier.notified().await;
 
                     let number_of_unique_peers =
                         async |message_execution_queue: &Arc<RwLock<MessageExecutionQueue>>| {
@@ -230,8 +245,9 @@ impl PeerState {
                         match message_to_execute {
                             Some(message_to_print) => {
                                 log::info(&cformat!(
-                                    "<bold>{}:</bold> {}",
+                                    "<bold>({},{}):</bold> {}",
                                     message_to_print.clock.unwrap().sender_id,
+                                    message_to_print.clock.unwrap().timestamp,
                                     message_to_print.content
                                 ));
                             }
@@ -240,6 +256,49 @@ impl PeerState {
 
                         peers_count = number_of_unique_peers(&message_execution_queue).await;
                     }
+                }
+            });
+        }
+
+        let intentions = self.intentions.clone();
+
+        if matches!(intentions, Intentions::Malicious) {
+            let time = self.time.clone();
+            let poisson_process = poisson_process.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    sleep(Duration::from_secs_f32(
+                        poisson_process.write().await.time_for_next_event() * MALICIOUS_RATE,
+                    ))
+                    .await;
+
+                    let tampering = poisson_process
+                        .write()
+                        .await
+                        .rng
+                        .random_range(0..*time.read().await);
+                    let sum_or_sub = poisson_process.write().await.rng.random_range(0..=1);
+
+                    let current_time = *time.read().await;
+                    *time.write().await = match sum_or_sub {
+                        0 => {
+                            log::warning(&cformat!(
+                                "Tampered with time value -> <bold>-{}</bold>.",
+                                tampering
+                            ));
+
+                            current_time - tampering
+                        }
+                        _ => {
+                            log::warning(&cformat!(
+                                "Tampered with time value -> <bold>+{}</bold>.",
+                                tampering
+                            ));
+
+                            current_time + tampering
+                        }
+                    };
                 }
             });
         }
@@ -273,12 +332,50 @@ impl PeerService for PeerState {
     async fn send_message(
         &self,
         request: Request<Message>,
-    ) -> Result<Response<Successful>, Status> {
-        let notifier = self.notifier.clone();
+    ) -> Result<Response<RequestStatus>, Status> {
+        let push_notifier = self.push_notifier.clone();
+        let history = self.history.clone();
+        let intentions = self.intentions.clone();
 
         let received_message = request.into_inner();
         if let Some(clock) = &received_message.clock {
             {
+                {
+                    if let Some(last_timestamp) = history.read().await.get(&clock.sender_id) {
+                        // a
+                        if matches!(intentions, Intentions::Benevolent)
+                            && clock.timestamp <= *last_timestamp
+                        {
+                            log::error(&cformat!(
+                                "Declaring <bold>{}</bold> as malicious peer for reason <bold>(A)</bold> and aborting protocol.",
+                                clock.sender_id
+                            ));
+
+                            exit(1);
+
+                            // return Ok(Response::new(RequestStatus { v: 1 }));
+                        }
+
+                        // b
+                        if matches!(intentions, Intentions::Benevolent)
+                            && clock.timestamp > *self.time.clone().read().await + MAX_DIFF
+                        {
+                            log::error(&cformat!(
+                                "Declaring <bold>{}</bold> as malicious peer for reason <bold>(B)</bold> and aborting protocol.",
+                                clock.sender_id
+                            ));
+
+                            exit(1);
+
+                            // return Ok(Response::new(RequestStatus { v: 1 }));
+                        }
+                    }
+
+                    history
+                        .write()
+                        .await
+                        .insert(clock.sender_id, clock.timestamp);
+                }
                 let current_time = *self.time.read().await;
                 *self.time.write().await = max(current_time, clock.timestamp) + 1;
             }
@@ -286,9 +383,9 @@ impl PeerService for PeerState {
             self.message_execution_queue
                 .write()
                 .await
-                .ordered_push(received_message, &notifier);
+                .ordered_push(received_message, &push_notifier);
         }
 
-        Ok(Response::new(Successful {}))
+        Ok(Response::new(RequestStatus { v: 0 }))
     }
 }

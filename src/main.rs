@@ -1,7 +1,7 @@
 use chat_with_tom::{
     CONFIG_FILE_PATH,
     config::{addresses_from_file, split_from_id},
-    peer::PeerState,
+    peer::{Intentions, PeerState},
 };
 use clap::Parser;
 
@@ -9,6 +9,9 @@ use clap::Parser;
 #[command(version, about, long_about = None)]
 struct Args {
     id: u32,
+
+    #[arg(long)]
+    malicious: bool,
 }
 
 #[tokio::main]
@@ -18,7 +21,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (own_address, peers_indexes_addresses) =
         split_from_id(args.id, addresses_from_file(CONFIG_FILE_PATH)?);
 
-    let state = PeerState::new(args.id, own_address)?;
+    let intentions = match args.malicious {
+        true => Intentions::Malicious,
+        false => Intentions::Benevolent,
+    };
+
+    let state = PeerState::new(args.id, own_address, intentions)?;
 
     state.run(peers_indexes_addresses).await?;
 

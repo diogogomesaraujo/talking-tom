@@ -11,8 +11,15 @@ message Message {
   string content = 2;
 }
 
-message Successful {}
+enum RequestStatusEnum {
+  SUCCESSFUL = 0;
+  DECLARED_MALICIOUS = 1;
+}
+
+message RequestStatus {
+  RequestStatusEnum v = 1;
+}
 
 service PeerService {
-  rpc SendMessage(Message) returns (Successful);
+  rpc SendMessage(Message) returns (RequestStatus);
 }
