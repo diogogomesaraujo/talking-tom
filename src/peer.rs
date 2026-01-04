@@ -366,7 +366,7 @@ impl PeerService for PeerState {
                         if matches!(intentions, Intentions::Benevolent)
                             && clock.timestamp > *self.time.clone().read().await + MAX_DIFF
                         {
-                            log::error(&cformat!(
+                            log::warning(&cformat!(
                                 "Declaring <bold>{}</bold> as malicious peer for reason <bold>(B)</bold> (every message from this peer will be rejected).",
                                 clock.sender_id
                             ));
