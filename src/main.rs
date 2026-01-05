@@ -1,9 +1,9 @@
-use chat_with_tom::{
+use clap::Parser;
+use talking_tom::{
     CONFIG_FILE_PATH,
     config::{addresses_from_file, split_from_id},
     peer::{Intentions, PeerState},
 };
-use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
